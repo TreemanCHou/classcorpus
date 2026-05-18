@@ -1,0 +1,20 @@
+{
+    "course_name": "Physics",
+    "material_name": "Electromagnetic_Optics_Quantum_Physics.pdf",
+    "book_start_page": 1,
+    "book_end_page": 507,
+    "cover_start_page": 1,
+    "cover_end_page": 1,
+    "toc_start_page": 2,
+    "toc_end_page": 9,
+    "text_start_page": 10,
+    "text_end_page": 479,
+    "appendix_start_page": 480,
+    "appendix_end_page": 507,
+    "toc_max_level": 3,
+    "toc_re_expression": [
+        "(第\\d+篇.*\\n\\n)",
+        "(第\\d+章.*\\n\\n|.*物理趣闻.*\\n\\n|.*元素周期表.*\\n\\n|.*数值表.*\\n\\n|.*部分习题答案.*\\n\\n|.*索引.*\\n\\n)",
+        "(\\*?\\d+\\.\\d+.*\\n\\n|.+?\\n\\n)"
+    ]
+}
