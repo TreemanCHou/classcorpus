@@ -31,6 +31,7 @@ from .graph import (
     VERT_HAS_SUBSECTION,
 )
 from .llm import LLMClient
+from .md_parse import parse_markdown_file
 from .pdf_parse import TocNode, parse_pdf_to_tree, render_outline, tree_summary
 
 
@@ -268,18 +269,19 @@ def extract_section_relations(kg: KnowledgeGraph, llm: LLMClient, course: str) -
 
 # ------------------------------------------------------------------- driver
 
-def run_phase1(
-    pdf_path: str,
-    user_cfg: UserConfig,
-    api_cfg: ApiConfig,
-    *,
-    checkpoint_path: Optional[str] = None,
-) -> KnowledgeGraph:
-    logger.section(f"Phase 1 · 初始构建 (course={user_cfg.course_name})")
-
-    logger.step("1) 解析 PDF + TOC 切分")
-    tree = parse_pdf_to_tree(
-        pdf_path,
+def parse_source_to_tree(source_path: str, user_cfg: UserConfig) -> TocNode:
+    """根据 user_cfg.source_type 调度对应解析器，统一返回 TocNode。"""
+    if user_cfg.source_type == "markdown":
+        return parse_markdown_file(
+            source_path,
+            material_name=user_cfg.material_name or None,
+            max_level=user_cfg.md_max_level,
+            min_level=user_cfg.md_min_level,
+            skip_heading_patterns=user_cfg.md_skip_heading_patterns or None,
+            strip_heading_pattern=user_cfg.md_strip_heading_pattern or None,
+        )
+    return parse_pdf_to_tree(
+        source_path,
         course=user_cfg.course_name,
         material=user_cfg.material_name,
         text_start_page=user_cfg.text_start_page,
@@ -287,11 +289,30 @@ def run_phase1(
         toc_re_expression=user_cfg.toc_re_expression,
         toc_max_level=user_cfg.toc_max_level,
     )
+
+
+def run_phase1(
+    source_path: str,
+    user_cfg: UserConfig,
+    api_cfg: ApiConfig,
+    *,
+    checkpoint_path: Optional[str] = None,
+) -> KnowledgeGraph:
+    logger.section(
+        f"Phase 1 · 初始构建 (course={user_cfg.course_name}, source_type={user_cfg.source_type})"
+    )
+
+    logger.step(f"1) 解析 {user_cfg.source_type.upper()} + 章节切分")
+    tree = parse_source_to_tree(source_path, user_cfg)
     diag = tree_summary(tree)
-    logger.info(f"TOC 层级统计: {diag}")
+    logger.info(f"章节层级统计: {diag}")
     logger.info("大纲预览（前若干行）:\n" + render_outline(tree, max_lines=40))
     if diag.get("leaves", 0) == 0:
-        logger.error("TOC 切分得到 0 个叶子节点，请检查 toc_re_expression 与 page 范围。")
+        logger.error(
+            "切分后得到 0 个叶子节点。"
+            + ("请检查 toc_re_expression 与 page 范围。" if user_cfg.source_type == "pdf"
+               else "请检查 md_min_level/md_max_level 与文档标题。")
+        )
         logger.pause("调整配置后回车继续，或 Ctrl+C 退出。")
 
     logger.step("2) 构造 KG 骨架")

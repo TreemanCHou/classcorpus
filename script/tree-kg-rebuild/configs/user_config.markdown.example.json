@@ -1,0 +1,16 @@
+{
+    "_comment": "Markdown 输入示例（OCR 后的 .md 也适用）。pdf 相关页码/正则字段在此模式下全部忽略。",
+    "course_name": "义务教育劳动课程标准",
+    "material_name": "劳动课程标准(2022年版)",
+    "source_type": "markdown",
+
+    "md_min_level": 1,
+    "md_max_level": 4,
+
+    "md_skip_heading_patterns": [
+        "^目录$",
+        "^前言$"
+    ],
+
+    "md_strip_heading_pattern": "\\s+\\d+\\s*$"
+}

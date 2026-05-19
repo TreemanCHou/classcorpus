@@ -54,42 +54,102 @@ class StageEndpoint:
 
 @dataclass
 class UserConfig:
+    """统一的用户配置。兼容 PDF 与 Markdown 两类输入。
+
+    - PDF 用 page 区间 + toc_re_expression 切分
+    - Markdown 用 `#` 标题层级原生切分（无需正则）
+
+    source_type 可由调用方显式覆盖（main.py 会按 --input/--markdown 自动判定）。
+    """
+
     course_name: str
     material_name: str
-    book_start_page: int
-    book_end_page: int
-    cover_start_page: int
-    cover_end_page: int
-    toc_start_page: int
-    toc_end_page: int
-    text_start_page: int
-    text_end_page: int
-    appendix_start_page: int
-    appendix_end_page: int
-    toc_max_level: int
-    toc_re_expression: List[str]
+    source_type: str = "pdf"  # "pdf" | "markdown"
+
+    # ---------- PDF-specific（markdown 时全部忽略） ----------
+    book_start_page: int = 1
+    book_end_page: int = 0
+    cover_start_page: int = 1
+    cover_end_page: int = 1
+    toc_start_page: int = 1
+    toc_end_page: int = 1
+    text_start_page: int = 1
+    text_end_page: int = 0
+    appendix_start_page: int = 0
+    appendix_end_page: int = 0
+    toc_max_level: int = 3
+    toc_re_expression: List[str] = field(default_factory=list)
+
+    # ---------- Markdown-specific（pdf 时忽略） ----------
+    md_max_level: int = 6
+    md_min_level: int = 1
+    md_skip_heading_patterns: List[str] = field(default_factory=list)
+    md_strip_heading_pattern: str = ""
+
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, path: str) -> "UserConfig":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserConfig":
+        source_type = str(data.get("source_type", "pdf")).lower()
+        kwargs: Dict[str, Any] = {
+            "source_type": source_type,
+            "raw": data,
+        }
+
+        if source_type == "pdf":
+            # PDF 模式下 course/material 名称必填，因为页码/正则也是用户必须显式指定的
+            kwargs["course_name"] = data["course_name"]
+            kwargs["material_name"] = data["material_name"]
+            for f_name in (
+                "book_start_page", "book_end_page",
+                "cover_start_page", "cover_end_page",
+                "toc_start_page", "toc_end_page",
+                "text_start_page", "text_end_page",
+                "appendix_start_page", "appendix_end_page",
+                "toc_max_level",
+            ):
+                if f_name in data:
+                    kwargs[f_name] = int(data[f_name])
+            if "toc_re_expression" in data:
+                kwargs["toc_re_expression"] = list(data["toc_re_expression"])
+
+        elif source_type == "markdown":
+            # Markdown 模式下 course/material 名称可选，缺省由 main.py 用文件名补齐
+            if "course_name" in data:
+                kwargs["course_name"] = data["course_name"]
+            if "material_name" in data:
+                kwargs["material_name"] = data["material_name"]
+            if "md_max_level" in data:
+                kwargs["md_max_level"] = int(data["md_max_level"])
+            if "md_min_level" in data:
+                kwargs["md_min_level"] = int(data["md_min_level"])
+            if "md_skip_heading_patterns" in data:
+                kwargs["md_skip_heading_patterns"] = list(data["md_skip_heading_patterns"])
+            if "md_strip_heading_pattern" in data:
+                kwargs["md_strip_heading_pattern"] = str(data["md_strip_heading_pattern"])
+        else:
+            raise ValueError(f"未知的 source_type: {source_type!r}（仅支持 pdf / markdown）")
+
+        # 兜底
+        kwargs.setdefault("course_name", "")
+        kwargs.setdefault("material_name", "")
+        return cls(**kwargs)
+
+    @classmethod
+    def default_for_markdown(cls, source_path: str) -> "UserConfig":
+        """Markdown 模式下的零配置默认值：所有名字都从文件名取。"""
+        stem = os.path.splitext(os.path.basename(source_path))[0]
         return cls(
-            course_name=data["course_name"],
-            material_name=data["material_name"],
-            book_start_page=int(data["book_start_page"]),
-            book_end_page=int(data["book_end_page"]),
-            cover_start_page=int(data["cover_start_page"]),
-            cover_end_page=int(data["cover_end_page"]),
-            toc_start_page=int(data["toc_start_page"]),
-            toc_end_page=int(data["toc_end_page"]),
-            text_start_page=int(data["text_start_page"]),
-            text_end_page=int(data["text_end_page"]),
-            appendix_start_page=int(data["appendix_start_page"]),
-            appendix_end_page=int(data["appendix_end_page"]),
-            toc_max_level=int(data["toc_max_level"]),
-            toc_re_expression=list(data["toc_re_expression"]),
-            raw=data,
+            course_name=stem,
+            material_name=stem,
+            source_type="markdown",
+            raw={"source_type": "markdown", "_synthetic": True, "_from": source_path},
         )
 
 

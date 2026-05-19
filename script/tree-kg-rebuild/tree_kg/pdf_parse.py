@@ -17,15 +17,21 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-try:
-    import fitz  # PyMuPDF
-except ImportError as e:
-    raise ImportError("缺少 PyMuPDF。请执行 pip install -r requirements.txt") from e
+
+def _import_fitz():
+    """懒加载 PyMuPDF：只有真正用 PDF 解析时才要求依赖。"""
+    try:
+        import fitz  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "缺少 PyMuPDF。请执行: pip install pymupdf （或运行 pip install -r requirements.txt）"
+        ) from e
+    return fitz
 
 
 @dataclass
 class TocNode:
-    """TOC 切分得到的层级树节点。"""
+    """TOC 切分得到的层级树节点（PDF / Markdown 共用）。"""
     name: str
     level: int               # 0 = book 根
     children: List["TocNode"] = field(default_factory=list)
@@ -42,6 +48,7 @@ class TocNode:
 
 def extract_text_by_pages(pdf_path: str, start: int, end: int) -> str:
     """提取 [start, end] 闭区间页（1-based）的纯文本，每页之间双换行。"""
+    fitz = _import_fitz()
     doc = fitz.open(pdf_path)
     try:
         pages = []
