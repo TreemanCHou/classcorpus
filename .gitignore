@@ -1,0 +1,4 @@
+# Local API keys / credentials
+/script/tree-kg-rebuild/configs/api_config.json
+/script/tree-kg-rebuild/configs/api_config.example.json
+/script/tree-kg-rebuild/configs/apikeys
