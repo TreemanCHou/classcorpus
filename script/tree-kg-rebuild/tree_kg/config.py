@@ -155,7 +155,7 @@ class UserConfig:
 
 @dataclass
 class RuntimeConfig:
-    concurrency: int = 4
+    concurrency: int = 5
     checkpoint_dir: str = "./output/checkpoints"
     output_dir: str = "./output"
     dedup_threshold: float = 0.55

@@ -4,9 +4,9 @@
 1. 不让上层直接 import openai；后续如果要换 SDK，只需改本模块。
 2. 同时提供 chat (JSON 模式) 与 embedding 两类接口。
 3. 错误分类：
-   - **可恢复网络错误**（连接断开、超时、5xx、Rate limit）→ 退避重试。
-   - **资源型错误**（额度不足、auth 失败、欠费 402、403）→ 暂停等待用户处理后回车继续。
-   - **不可恢复**（参数错误等 4xx 非 401/402/403/429）→ 抛出。
+   - **可恢复网络错误**（连接断开、超时、5xx、Rate limit）→ 自动重试。
+   - **资源型错误**（额度不足、auth 失败、欠费 402、403）→ 给出提示并自动重试。
+   - **多次失败** → 抛给阶段逻辑，由阶段逻辑决定重试当前项或跳过。
 4. 提供 stage 维度路由：根据 ApiConfig 选择对应 endpoint。
 """
 
@@ -130,21 +130,36 @@ class LLMClient:
         - 优先使用 response_format=json_object（若服务端支持）。
         - 失败 (BadRequestError) 则回退到 plain，再用正则提取。
         """
-        try:
-            if try_native_json:
-                raw = self.chat(
-                    stage,
-                    messages,
-                    json_mode=True,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-            else:
-                raw = self.chat(stage, messages, json_mode=False, temperature=temperature, max_tokens=max_tokens)
-        except BadRequestError as e:
-            logger.warn(f"[{stage}] 服务端不支持 json_object 模式，降级为纯文本: {e}")
-            raw = self.chat(stage, messages, json_mode=False, temperature=temperature, max_tokens=max_tokens)
-        return _extract_json(raw)
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                try:
+                    if try_native_json:
+                        raw = self.chat(
+                            stage,
+                            messages,
+                            json_mode=True,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                        )
+                    else:
+                        raw = self.chat(stage, messages, json_mode=False, temperature=temperature, max_tokens=max_tokens)
+                except BadRequestError as e:
+                    logger.warn(f"[{stage}] 服务端不支持 json_object 模式，降级为纯文本: {e}")
+                    raw = self.chat(stage, messages, json_mode=False, temperature=temperature, max_tokens=max_tokens)
+                return _extract_json(raw)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:  # noqa: BLE001
+                if attempts < 3:
+                    logger.warn(
+                        f"[{stage}/json] JSON 解析/调用失败 ({type(e).__name__}): {e} | "
+                        f"2.0s 后重试 ({attempts}/3)"
+                    )
+                    time.sleep(2.0)
+                    continue
+                raise
 
     # ------------------------------------------------------------------- embed
     def embed(self, stage: str, inputs: List[str]) -> List[List[float]]:
@@ -169,58 +184,55 @@ class LLMClient:
 
     # --------------------------------------------------------- recovery loop
     def _invoke_with_recovery(self, *, stage: str, ep: StageEndpoint, label: str, fn):
-        """统一调用包装：可恢复重试 / 资源型暂停 / 其他抛出。"""
+        """统一调用包装：失败时自动重试 3 次，仍失败则向上抛出。"""
         attempts = 0
         while True:
             attempts += 1
             try:
                 return fn()
             except _RETRYABLE_EXC as e:
-                if attempts <= ep.max_retries:
-                    delay = ep.retry_backoff ** attempts
+                if attempts < 3:
                     logger.warn(
                         f"[{stage}/{label}] 网络/服务波动 ({type(e).__name__}): {e} | "
-                        f"{delay:.1f}s 后重试 ({attempts}/{ep.max_retries})"
+                        f"2.0s 后重试 ({attempts}/3)"
                     )
-                    time.sleep(delay)
+                    time.sleep(2.0)
                     continue
-                logger.error(
-                    f"[{stage}/{label}] 多次重试仍失败: {type(e).__name__}: {e}。请检查网络。"
-                )
-                logger.pause("修复网络后按回车重试，或 Ctrl+C 终止。")
-                attempts = 0  # 重置
-                continue
+                raise
             except _PAUSABLE_EXC as e:
                 msg = str(e)
                 hint = _resource_hint(e, msg)
                 logger.error(f"[{stage}/{label}] {type(e).__name__}: {msg}")
                 logger.warn(f"提示：{hint}")
-                logger.pause("处理完成（充值 / 更换 KEY / 等待限频）后按回车继续。")
-                attempts = 0  # 处理后重新尝试
-                continue
+                if attempts < 3:
+                    logger.warn(f"[{stage}/{label}] 2.0s 后重试 ({attempts}/3)")
+                    time.sleep(2.0)
+                    continue
+                raise
             except APIStatusError as e:  # type: ignore[misc]
                 status = getattr(e, "status_code", None)
                 if status in (401, 402, 403, 429):
                     logger.error(f"[{stage}/{label}] HTTP {status}: {e}")
                     logger.warn("可能是鉴权失败/欠费/限频，请处理后继续。")
-                    logger.pause()
-                    attempts = 0
-                    continue
-                if status and 500 <= status < 600 and attempts <= ep.max_retries:
-                    delay = ep.retry_backoff ** attempts
-                    logger.warn(f"[{stage}/{label}] 服务端 5xx: {e}，{delay:.1f}s 后重试")
-                    time.sleep(delay)
+                    if attempts < 3:
+                        logger.warn(f"[{stage}/{label}] 2.0s 后重试 ({attempts}/3)")
+                        time.sleep(2.0)
+                        continue
+                    raise
+                if status and 500 <= status < 600 and attempts < 3:
+                    logger.warn(f"[{stage}/{label}] 服务端 5xx: {e}，2.0s 后重试 ({attempts}/3)")
+                    time.sleep(2.0)
                     continue
                 raise
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # noqa: BLE001
-                # 兜底：未知异常先暂停一次给用户排查机会
                 logger.error(f"[{stage}/{label}] 未预期错误 {type(e).__name__}: {e}")
-                logger.warn("已暂停。如需继续将再次尝试调用，否则可 Ctrl+C 退出。")
-                logger.pause()
-                attempts = 0
-                continue
+                if attempts < 3:
+                    logger.warn(f"[{stage}/{label}] 2.0s 后重试 ({attempts}/3)")
+                    time.sleep(2.0)
+                    continue
+                raise
 
 
 def _resource_hint(exc: Exception, msg: str) -> str:

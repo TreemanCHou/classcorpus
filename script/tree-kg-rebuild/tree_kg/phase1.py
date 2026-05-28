@@ -11,9 +11,8 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
-
-from tqdm import tqdm
 
 from . import logger, prompts
 from .config import ApiConfig, UserConfig
@@ -33,6 +32,7 @@ from .graph import (
 from .llm import LLMClient
 from .md_parse import parse_markdown_file
 from .pdf_parse import TocNode, parse_pdf_to_tree, render_outline, tree_summary
+from .retry import parallel_map_retryable
 
 
 def _toc_layer(level: int, is_leaf: bool) -> str:
@@ -83,7 +83,20 @@ def section_path(kg: KnowledgeGraph, node_id: str) -> str:
 
 # ------------------------------------------------------------ summarization
 
-def bottom_up_summarize(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None:
+def _thread_llm(base_llm: LLMClient):
+    local = threading.local()
+
+    def _get() -> LLMClient:
+        cli = getattr(local, "llm", None)
+        if cli is None:
+            cli = LLMClient(base_llm.api_cfg)
+            local.llm = cli
+        return cli
+
+    return _get
+
+
+def bottom_up_summarize(kg: KnowledgeGraph, llm: LLMClient, course: str, *, concurrency: int = 1) -> None:
     """自下而上，给所有 TOC 节点写 description（即论文中的 summary）。"""
     toc_layers = {LAYER_BOOK, LAYER_CHAPTER_OR_SECTION, LAYER_SUBSECTION_LEAF}
     nodes = [n for n in kg.nodes.values() if n.layer in toc_layers]
@@ -93,60 +106,106 @@ def bottom_up_summarize(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None
     inners = [n for n in nodes if n.layer != LAYER_SUBSECTION_LEAF]
 
     logger.subsection("Phase1.A · 自下而上摘要 - 叶子节点")
-    for leaf in tqdm(leaves, desc="leaf summary", unit="sec"):
+    leaf_targets: List[Node] = []
+    for leaf in leaves:
         if leaf.description:
             continue
         if not leaf.raw_text.strip():
             leaf.description = ""
             continue
+        leaf_targets.append(leaf)
+
+    get_llm = _thread_llm(llm)
+
+    def _summarize_leaf(leaf: Node, cli: LLMClient) -> str:
         parent_id = kg.parent(leaf.id)
         parent_summary = kg.nodes[parent_id].description if parent_id else ""
-        try:
-            res = llm.chat_json("summary", prompts.summary_messages(course, parent_summary, leaf.raw_text))
-            leaf.description = (res.get("summary") if isinstance(res, dict) else str(res)) or ""
-        except Exception as e:
-            logger.warn(f"叶子摘要失败 {leaf.name[:30]}: {e}")
-            logger.pause("是否跳过？回车继续，下一个叶子；或 Ctrl+C 终止。")
-            leaf.description = ""
+        res = cli.chat_json("summary", prompts.summary_messages(course, parent_summary, leaf.raw_text))
+        return (res.get("summary") if isinstance(res, dict) else str(res)) or ""
+
+    leaf_results = parallel_map_retryable(
+        leaf_targets,
+        lambda leaf: _summarize_leaf(leaf, get_llm()),
+        lambda leaf: _summarize_leaf(leaf, llm),
+        lambda leaf: f"叶子摘要失败 {leaf.name[:30]}",
+        concurrency=concurrency,
+        desc="leaf summary",
+        unit="sec",
+    )
+    for leaf, summary in zip(leaf_targets, leaf_results):
+        if summary is not None:
+            leaf.description = summary
 
     logger.subsection("Phase1.B · 自下而上摘要 - 上层聚合")
-    for n in tqdm(inners, desc="inner summary", unit="sec"):
-        children_ids = [c for c in kg.children(n.id) if kg.nodes[c].layer in toc_layers]
-        child_sums = [kg.nodes[c].description for c in children_ids if kg.nodes[c].description]
-        if not child_sums:
-            n.description = ""
-            continue
-        try:
-            res = llm.chat_json("summary", prompts.aggregate_summary_messages(course, child_sums))
-            n.description = (res.get("summary") if isinstance(res, dict) else str(res)) or ""
-        except Exception as e:
-            logger.warn(f"父节点摘要失败 {n.name[:30]}: {e}")
-            logger.pause("回车继续。")
-            n.description = ""
+    def _summarize_inner(item: Tuple[Node, List[str]], cli: LLMClient) -> str:
+        _, child_sums = item
+        res = cli.chat_json("summary", prompts.aggregate_summary_messages(course, child_sums))
+        return (res.get("summary") if isinstance(res, dict) else str(res)) or ""
+
+    for depth in sorted({n.depth for n in inners}, reverse=True):
+        batch: List[Tuple[Node, List[str]]] = []
+        for n in [x for x in inners if x.depth == depth]:
+            children_ids = [c for c in kg.children(n.id) if kg.nodes[c].layer in toc_layers]
+            child_sums = [kg.nodes[c].description for c in children_ids if kg.nodes[c].description]
+            if not child_sums:
+                n.description = ""
+                continue
+            batch.append((n, child_sums))
+        results = parallel_map_retryable(
+            batch,
+            lambda item: _summarize_inner(item, get_llm()),
+            lambda item: _summarize_inner(item, llm),
+            lambda item: f"父节点摘要失败 {item[0].name[:30]}",
+            concurrency=concurrency,
+            desc=f"inner summary d{depth}",
+            unit="sec",
+        )
+        for (n, _), summary in zip(batch, results):
+            if summary is not None:
+                n.description = summary
 
 
 # ----------------------------------------------------------- entity / relation
 
-def extract_entities_and_relations(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None:
+def extract_entities_and_relations(kg: KnowledgeGraph, llm: LLMClient, course: str, *, concurrency: int = 1) -> None:
     """对每个叶子 TOC 节点，抽取实体 + has_entity 垂直边 + entity_related 水平边。"""
     leaves = kg.nodes_at_layer(LAYER_SUBSECTION_LEAF)
     logger.subsection(f"Phase1.C · 实体/关系抽取（{len(leaves)} 个叶子节点）")
 
-    for leaf in tqdm(leaves, desc="entity/relation", unit="sec"):
-        if not leaf.description:
-            continue
-        path = section_path(kg, leaf.id)
-        # 1) entities
-        try:
-            ent_res = llm.chat_json(
-                "extract", prompts.entity_extract_messages(course, path, leaf.description)
-            )
-            ent_list = (ent_res or {}).get("entities", []) if isinstance(ent_res, dict) else []
-        except Exception as e:
-            logger.warn(f"实体抽取失败 {leaf.name[:30]}: {e}")
-            logger.pause("回车继续。")
-            continue
+    targets = [leaf for leaf in leaves if leaf.description]
+    get_llm = _thread_llm(llm)
 
+    def _extract_leaf(leaf: Node, cli: LLMClient) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        path = section_path(kg, leaf.id)
+        ent_res = cli.chat_json(
+            "extract", prompts.entity_extract_messages(course, path, leaf.description)
+        )
+        ent_list = (ent_res or {}).get("entities", []) if isinstance(ent_res, dict) else []
+        ent_list = [ent for ent in ent_list if (ent.get("name") or "").strip()]
+        rels: List[Dict[str, Any]] = []
+        if len(ent_list) >= 2:
+            rel_res = cli.chat_json(
+                "extract",
+                prompts.relation_extract_messages(course, path, leaf.description, ent_list),
+            )
+            rels = (rel_res or {}).get("relations", []) if isinstance(rel_res, dict) else []
+        return leaf.id, ent_list, rels
+
+    results = parallel_map_retryable(
+        targets,
+        lambda leaf: _extract_leaf(leaf, get_llm()),
+        lambda leaf: _extract_leaf(leaf, llm),
+        lambda leaf: f"实体/关系抽取失败 {leaf.name[:30]}",
+        concurrency=concurrency,
+        desc="entity/relation",
+        unit="sec",
+    )
+
+    for result in results:
+        if result is None:
+            continue
+        leaf_id, ent_list, rels = result
+        leaf = kg.nodes[leaf_id]
         # 节点：实体先以 core 默认入图（aggr 阶段会改 role）
         leaf_entity_ids: List[Tuple[str, Dict[str, Any]]] = []
         for ent in ent_list:
@@ -166,7 +225,7 @@ def extract_entities_and_relations(kg: KnowledgeGraph, llm: LLMClient, course: s
             )
             kg.add_node(node)
             kg.add_edge(Edge(
-                src=leaf.id,
+                src=leaf_id,
                 dst=nid,
                 kind="vertical",
                 category=VERT_HAS_ENTITY,
@@ -175,21 +234,6 @@ def extract_entities_and_relations(kg: KnowledgeGraph, llm: LLMClient, course: s
 
         if len(leaf_entity_ids) < 2:
             continue
-
-        # 2) relations
-        try:
-            rel_res = llm.chat_json(
-                "extract",
-                prompts.relation_extract_messages(
-                    course, path, leaf.description,
-                    [e for _, e in leaf_entity_ids],
-                ),
-            )
-            rels = (rel_res or {}).get("relations", []) if isinstance(rel_res, dict) else []
-        except Exception as e:
-            logger.warn(f"关系抽取失败 {leaf.name[:30]}: {e}")
-            logger.pause("回车继续。")
-            rels = []
 
         name_to_id = {ent["name"]: nid for nid, ent in leaf_entity_ids}
         for r in rels:
@@ -216,13 +260,14 @@ def extract_entities_and_relations(kg: KnowledgeGraph, llm: LLMClient, course: s
             ))
 
 
-def extract_section_relations(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None:
+def extract_section_relations(kg: KnowledgeGraph, llm: LLMClient, course: str, *, concurrency: int = 1) -> None:
     """对每个有多个 TOC 子节点的节点，抽取子节点之间的 section_related 关系。"""
     toc_layers = {LAYER_BOOK, LAYER_CHAPTER_OR_SECTION, LAYER_SUBSECTION_LEAF}
     inners = [n for n in kg.nodes.values() if n.layer in {LAYER_BOOK, LAYER_CHAPTER_OR_SECTION}]
     logger.subsection(f"Phase1.D · 章节关系抽取（{len(inners)} 个父节点）")
 
-    for n in tqdm(inners, desc="section relations", unit="sec"):
+    targets: List[Tuple[Node, List[str], List[Dict[str, str]], str]] = []
+    for n in inners:
         children_ids = [c for c in kg.children(n.id) if kg.nodes[c].layer in toc_layers]
         if len(children_ids) < 2:
             continue
@@ -231,17 +276,33 @@ def extract_section_relations(kg: KnowledgeGraph, llm: LLMClient, course: str) -
             for c in children_ids
         ]
         path = section_path(kg, n.id)
-        try:
-            res = llm.chat_json(
-                "extract",
-                prompts.section_relation_messages(course, path, n.description or "", cdata),
-            )
-            rels = (res or {}).get("relations", []) if isinstance(res, dict) else []
-        except Exception as e:
-            logger.warn(f"章节关系抽取失败 {n.name[:30]}: {e}")
-            logger.pause("回车继续。")
-            continue
+        targets.append((n, children_ids, cdata, path))
 
+    get_llm = _thread_llm(llm)
+
+    def _extract_section(item: Tuple[Node, List[str], List[Dict[str, str]], str], cli: LLMClient):
+        n, children_ids, cdata, path = item
+        res = cli.chat_json(
+            "extract",
+            prompts.section_relation_messages(course, path, n.description or "", cdata),
+        )
+        rels = (res or {}).get("relations", []) if isinstance(res, dict) else []
+        return n.id, children_ids, rels
+
+    results = parallel_map_retryable(
+        targets,
+        lambda item: _extract_section(item, get_llm()),
+        lambda item: _extract_section(item, llm),
+        lambda item: f"章节关系抽取失败 {item[0].name[:30]}",
+        concurrency=concurrency,
+        desc="section relations",
+        unit="sec",
+    )
+
+    for result in results:
+        if result is None:
+            continue
+        _, children_ids, rels = result
         name_to_id = {kg.nodes[c].name: c for c in children_ids}
         for r in rels:
             sub = r.get("subject")
@@ -320,19 +381,21 @@ def run_phase1(
     logger.info(f"KG 骨架: {kg.stats()}")
 
     llm = LLMClient(api_cfg)
+    concurrency = max(1, api_cfg.runtime.concurrency)
+    logger.info(f"LLM 并发线程数: {concurrency}")
 
     logger.step("3) 自下而上摘要")
-    bottom_up_summarize(kg, llm, user_cfg.course_name)
+    bottom_up_summarize(kg, llm, user_cfg.course_name, concurrency=concurrency)
 
     if checkpoint_path:
         kg.save(os.path.join(checkpoint_path, "phase1_after_summary.json"))
         logger.ok(f"已保存 checkpoint: phase1_after_summary.json")
 
     logger.step("4) 实体/关系抽取（叶子）")
-    extract_entities_and_relations(kg, llm, user_cfg.course_name)
+    extract_entities_and_relations(kg, llm, user_cfg.course_name, concurrency=concurrency)
 
     logger.step("5) 章节关系抽取（中间层）")
-    extract_section_relations(kg, llm, user_cfg.course_name)
+    extract_section_relations(kg, llm, user_cfg.course_name, concurrency=concurrency)
 
     if checkpoint_path:
         kg.save(os.path.join(checkpoint_path, "phase1_done.json"))

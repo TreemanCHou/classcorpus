@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from tqdm import tqdm
 
 from . import logger, prompts
 from .config import ApiConfig
@@ -30,6 +30,20 @@ from .graph import (
     VERT_HAS_SUBORDINATE,
 )
 from .llm import LLMClient
+from .retry import parallel_map_retryable
+
+
+def _thread_llm(base_llm: LLMClient):
+    local = threading.local()
+
+    def _get() -> LLMClient:
+        cli = getattr(local, "llm", None)
+        if cli is None:
+            cli = LLMClient(base_llm.api_cfg)
+            local.llm = cli
+        return cli
+
+    return _get
 
 
 def _entity_layers() -> Set[str]:
@@ -38,69 +52,97 @@ def _entity_layers() -> Set[str]:
 
 # ----------------------------------------------------------------- 1) conv
 
-def run_conv(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None:
+def run_conv(kg: KnowledgeGraph, llm: LLMClient, course: str, *, concurrency: int = 1) -> None:
     """对每个实体节点：基于其邻居增强描述。
 
     一步即可，论文表5 显示 conv 1 步收敛。
     """
     targets = [n for n in kg.nodes.values() if n.layer in _entity_layers()]
     logger.subsection(f"Phase2.A · 上下文卷积 conv（{len(targets)} 个实体）")
-    for ent in tqdm(targets, desc="conv", unit="ent"):
+    get_llm = _thread_llm(llm)
+
+    def _conv_entity(ent: Node, cli: LLMClient) -> Tuple[str, str]:
         nb_ids = list(kg.neighbors(ent.id))
         nbs = [
             {"name": kg.nodes[i].name, "description": kg.nodes[i].description, "type": kg.nodes[i].meta.get("type", "")}
             for i in nb_ids if kg.nodes[i].layer in _entity_layers() or kg.nodes[i].layer.startswith("subsection")
         ]
-        try:
-            res = llm.chat_json(
-                "conv",
-                prompts.conv_messages(course, {
-                    "name": ent.name,
-                    "type": ent.meta.get("type", ""),
-                    "description": ent.description,
-                }, nbs),
-            )
-            if isinstance(res, dict):
-                desc = res.get("description") or ""
-                definition = res.get("definition") or ""
-                role = res.get("role") or ""
-                merged = "\n".join(filter(None, [
-                    f"【定义】{definition}" if definition else "",
-                    f"【说明】{desc}" if desc else "",
-                    f"【角色】{role}" if role else "",
-                ]))
-                if merged:
-                    ent.description = merged
-        except Exception as e:
-            logger.warn(f"conv 失败 {ent.name[:30]}: {e}")
-            logger.pause("回车继续。")
+        res = cli.chat_json(
+            "conv",
+            prompts.conv_messages(course, {
+                "name": ent.name,
+                "type": ent.meta.get("type", ""),
+                "description": ent.description,
+            }, nbs),
+        )
+        if not isinstance(res, dict):
+            return ent.id, ""
+        desc = res.get("description") or ""
+        definition = res.get("definition") or ""
+        role = res.get("role") or ""
+        merged = "\n".join(filter(None, [
+            f"【定义】{definition}" if definition else "",
+            f"【说明】{desc}" if desc else "",
+            f"【角色】{role}" if role else "",
+        ]))
+        return ent.id, merged
+
+    results = parallel_map_retryable(
+        targets,
+        lambda ent: _conv_entity(ent, get_llm()),
+        lambda ent: _conv_entity(ent, llm),
+        lambda ent: f"conv 失败 {ent.name[:30]}",
+        concurrency=concurrency,
+        desc="conv",
+        unit="ent",
+    )
+    for result in results:
+        if result is None:
+            continue
+        ent_id, merged = result
+        if merged:
+            kg.nodes[ent_id].description = merged
 
 
 # -------------------------------------------------------- 2) entity aggr
 
-def run_aggr(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None:
+def run_aggr(kg: KnowledgeGraph, llm: LLMClient, course: str, *, concurrency: int = 1) -> None:
     """判定核心/非核心，把非核心实体的水平边转为 has_subordinate 垂直边。"""
     targets = [n for n in kg.nodes.values() if n.layer in _entity_layers()]
     logger.subsection(f"Phase2.B · 实体聚合 aggr（{len(targets)} 个实体）")
 
     # role classification
-    for ent in tqdm(targets, desc="role", unit="ent"):
+    get_llm = _thread_llm(llm)
+
+    def _classify_role(ent: Node, cli: LLMClient) -> Tuple[str, str]:
         nbs = []
         for nb_id in kg.neighbors(ent.id):
             nb = kg.nodes[nb_id]
             if nb.layer in _entity_layers():
                 nbs.append({"name": nb.name, "description": nb.description})
-        try:
-            res = llm.chat_json("aggr", prompts.aggr_role_messages(course, {
-                "name": ent.name, "description": ent.description,
-            }, nbs))
-            role = (res.get("role") if isinstance(res, dict) else "").strip().lower()
-            if role in ("core", "non-core"):
-                ent.role = role
-                ent.layer = LAYER_ENTITY_CORE if role == "core" else LAYER_ENTITY_NONCORE
-        except Exception as e:
-            logger.warn(f"aggr 角色判定失败 {ent.name[:30]}: {e}")
-            logger.pause("回车继续。")
+        res = cli.chat_json("aggr", prompts.aggr_role_messages(course, {
+            "name": ent.name, "description": ent.description,
+        }, nbs))
+        role = (res.get("role") if isinstance(res, dict) else "").strip().lower()
+        return ent.id, role
+
+    results = parallel_map_retryable(
+        targets,
+        lambda ent: _classify_role(ent, get_llm()),
+        lambda ent: _classify_role(ent, llm),
+        lambda ent: f"aggr 角色判定失败 {ent.name[:30]}",
+        concurrency=concurrency,
+        desc="role",
+        unit="ent",
+    )
+    for result in results:
+        if result is None:
+            continue
+        ent_id, role = result
+        if role in ("core", "non-core"):
+            ent = kg.nodes[ent_id]
+            ent.role = role
+            ent.layer = LAYER_ENTITY_CORE if role == "core" else LAYER_ENTITY_NONCORE
 
     # transform horizontal -> vertical for non-core peripherals
     logger.info("将非核心实体的水平连接重构为 has_subordinate 垂直边……")
@@ -136,7 +178,7 @@ def run_aggr(kg: KnowledgeGraph, llm: LLMClient, course: str) -> None:
 
 # -------------------------------------------------------------- 3) embed
 
-def run_embed(kg: KnowledgeGraph, llm: LLMClient) -> Dict[str, np.ndarray]:
+def run_embed(kg: KnowledgeGraph, llm: LLMClient, *, concurrency: int = 1) -> Dict[str, np.ndarray]:
     """对所有节点描述做嵌入，归一化后写入 node.embedding。"""
     nodes = list(kg.nodes.values())
     logger.subsection(f"Phase2.C · 节点嵌入 embed（{len(nodes)} 个节点）")
@@ -153,13 +195,46 @@ def run_embed(kg: KnowledgeGraph, llm: LLMClient) -> Dict[str, np.ndarray]:
     if not inputs:
         return {}
 
-    vecs = llm.embed("embed", inputs)
+    bs = max(1, llm.endpoint("embed").batch_size)
+    chunks = [
+        (i, inputs[i: i + bs])
+        for i in range(0, len(inputs), bs)
+    ]
+    get_llm = _thread_llm(llm)
+
+    def _embed_chunk(item: Tuple[int, List[str]], cli: LLMClient):
+        start, chunk = item
+        return start, cli.embed("embed", chunk)
+
+    chunk_results = parallel_map_retryable(
+        chunks,
+        lambda item: _embed_chunk(item, get_llm()),
+        lambda item: _embed_chunk(item, llm),
+        lambda item: f"embed 失败 batch[{item[0]}:{item[0] + len(item[1])}]",
+        concurrency=concurrency,
+        desc="embed",
+        unit="batch",
+    )
+    indexed_vecs: List[Tuple[str, List[float]]] = []
+    for result in chunk_results:
+        if result is None:
+            continue
+        start, chunk_vecs = result
+        indexed_vecs.extend(
+            (indices[start + offset], vec)
+            for offset, vec in enumerate(chunk_vecs)
+            if start + offset < len(indices)
+        )
+    if not indexed_vecs:
+        return {}
+
+    vecs = [vec for _, vec in indexed_vecs]
     arr = np.asarray(vecs, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
     arr = arr / norms
 
     out: Dict[str, np.ndarray] = {}
-    for i, nid in enumerate(indices):
+    for i, (nid, _) in enumerate(indexed_vecs):
         kg.nodes[nid].embedding = arr[i].tolist()
         out[nid] = arr[i]
     logger.ok(f"嵌入完成，维度 = {arr.shape[1]}")
@@ -186,6 +261,7 @@ def run_dedup(
     course: str,
     threshold: float = 0.55,
     top_k: int = 20,
+    concurrency: int = 1,
 ) -> int:
     """实体去重：FAISS/最近邻 + LLM 判同 + 并查集合并。
 
@@ -244,12 +320,11 @@ def run_dedup(
     candidates.sort(key=lambda x: x[0])
     logger.info(f"候选对数 = {len(candidates)}")
 
-    merged_count = 0
-    for d, a, b in tqdm(candidates, desc="dedup", unit="pair"):
-        if find(a) == find(b):
-            continue
-        try:
-            res = llm.chat_json("dedup", prompts.dedup_messages(course, {
+    get_llm = _thread_llm(llm)
+
+    def _judge_same(item: Tuple[float, str, str], cli: LLMClient) -> Tuple[str, str, bool]:
+        _, a, b = item
+        res = cli.chat_json("dedup", prompts.dedup_messages(course, {
                 "name": kg.nodes[a].name,
                 "aliases": kg.nodes[a].aliases,
                 "description": kg.nodes[a].description,
@@ -258,11 +333,24 @@ def run_dedup(
                 "aliases": kg.nodes[b].aliases,
                 "description": kg.nodes[b].description,
             }))
-            same = bool(res.get("same")) if isinstance(res, dict) else False
-        except Exception as e:
-            logger.warn(f"dedup 判同失败 {kg.nodes[a].name} ~ {kg.nodes[b].name}: {e}")
-            logger.pause("回车继续，将跳过本对。")
+        same = bool(res.get("same")) if isinstance(res, dict) else False
+        return a, b, same
+
+    judge_results = parallel_map_retryable(
+        candidates,
+        lambda item: _judge_same(item, get_llm()),
+        lambda item: _judge_same(item, llm),
+        lambda item: f"dedup 判同失败 {kg.nodes[item[1]].name} ~ {kg.nodes[item[2]].name}",
+        concurrency=concurrency,
+        desc="dedup",
+        unit="pair",
+    )
+
+    merged_count = 0
+    for result in judge_results:
+        if result is None:
             continue
+        a, b, same = result
         if same and union(a, b):
             merged_count += 1
 
@@ -360,6 +448,7 @@ def run_pred(
     delta_e_each_stage: int = 500,
     max_candidates: int = 5000,
     top_k_neighbors: int = 30,
+    concurrency: int = 1,
 ) -> int:
     """两阶段边预测。
 
@@ -381,8 +470,6 @@ def run_pred(
     nn = NearestNeighbors(n_neighbors=k, metric="cosine").fit(vecs)
     cos_dist, idx = nn.kneighbors(vecs)
     cos_sim = 1.0 - cos_dist
-
-    pos_of = {nid: i for i, nid in enumerate(ids)}
 
     def existing_edge(u: str, v: str) -> bool:
         ns = kg.neighbors(u)
@@ -414,40 +501,62 @@ def run_pred(
         return out[:max_candidates]
 
     added_total = 0
+    get_llm = _thread_llm(llm)
 
     def evaluate_and_add(cands: List[Tuple[float, str, str]], budget: int, label: str) -> int:
+        def _predict_edge(
+            item: Tuple[float, str, str],
+            cli: LLMClient,
+        ) -> Optional[Tuple[float, str, str, str, str, float]]:
+            score, a, b = item
+            res = cli.chat_json("pred", prompts.edge_pred_messages(course, {
+                "name": kg.nodes[a].name, "description": kg.nodes[a].description,
+            }, {
+                "name": kg.nodes[b].name, "description": kg.nodes[b].description,
+            }))
+            if not isinstance(res, dict):
+                return None
+            if not res.get("is_relevant"):
+                return None
+            strength = float(res.get("strength", 0))
+            if strength < strength_threshold:
+                return None
+            return (
+                score,
+                a,
+                b,
+                str(res.get("type", "")),
+                str(res.get("description", "")),
+                strength,
+            )
+
+        candidates = [item for item in cands if not existing_edge(item[1], item[2])]
+        predictions = parallel_map_retryable(
+            candidates,
+            lambda item: _predict_edge(item, get_llm()),
+            lambda item: _predict_edge(item, llm),
+            lambda item: f"pred 调用失败 {kg.nodes[item[1]].name} ~ {kg.nodes[item[2]].name}",
+            concurrency=concurrency,
+            desc=label,
+            unit="pair",
+        )
         added = 0
-        bar = tqdm(cands, desc=label, unit="pair")
-        for score, a, b in bar:
+        for prediction in predictions:
             if added >= budget:
                 break
+            if prediction is None:
+                continue
+            score, a, b, relation, description, strength = prediction
             if existing_edge(a, b):
                 continue
-            try:
-                res = llm.chat_json("pred", prompts.edge_pred_messages(course, {
-                    "name": kg.nodes[a].name, "description": kg.nodes[a].description,
-                }, {
-                    "name": kg.nodes[b].name, "description": kg.nodes[b].description,
-                }))
-                if not isinstance(res, dict):
-                    continue
-                if not res.get("is_relevant"):
-                    continue
-                strength = float(res.get("strength", 0))
-                if strength < strength_threshold:
-                    continue
-                kg.add_edge(Edge(
-                    src=a, dst=b, kind="horizontal", category=HORIZ_ENTITY_RELATED,
-                    relation=str(res.get("type", "")),
-                    description=str(res.get("description", "")),
-                    strength=strength,
-                    meta={"score": score, "stage": label},
-                ))
-                added += 1
-                bar.set_postfix(added=added)
-            except Exception as e:
-                logger.warn(f"pred 调用失败: {e}")
-                logger.pause("回车继续。")
+            kg.add_edge(Edge(
+                src=a, dst=b, kind="horizontal", category=HORIZ_ENTITY_RELATED,
+                relation=relation,
+                description=description,
+                strength=strength,
+                meta={"score": score, "stage": label},
+            ))
+            added += 1
         return added
 
     logger.info(f"Stage 1: alpha={alpha}, beta={beta_stage1}, gamma={gamma_stage1}")
@@ -490,24 +599,26 @@ def run_phase2(
     logger.section(f"Phase 2 · 迭代扩展 (course={course})")
     llm = LLMClient(api_cfg)
     rt = api_cfg.runtime
+    concurrency = max(1, rt.concurrency)
+    logger.info(f"LLM 并发线程数: {concurrency}")
 
     logger.step("1) 上下文卷积 conv")
-    run_conv(kg, llm, course)
+    run_conv(kg, llm, course, concurrency=concurrency)
     if checkpoint_path:
         kg.save(os.path.join(checkpoint_path, "phase2_after_conv.json"))
 
     logger.step("2) 实体聚合 aggr")
-    run_aggr(kg, llm, course)
+    run_aggr(kg, llm, course, concurrency=concurrency)
     if checkpoint_path:
         kg.save(os.path.join(checkpoint_path, "phase2_after_aggr.json"))
 
     logger.step("3) 节点嵌入 embed")
-    run_embed(kg, llm)
+    run_embed(kg, llm, concurrency=concurrency)
     if checkpoint_path:
         kg.save(os.path.join(checkpoint_path, "phase2_after_embed.json"))
 
     logger.step("4) 实体去重 dedup")
-    run_dedup(kg, llm, course, threshold=rt.dedup_threshold)
+    run_dedup(kg, llm, course, threshold=rt.dedup_threshold, concurrency=concurrency)
     # 去重后需要重新嵌入，因为有节点被合并，可选；这里仅在尺寸有较大变化时再做
     if checkpoint_path:
         kg.save(os.path.join(checkpoint_path, "phase2_after_dedup.json"))
@@ -523,6 +634,7 @@ def run_phase2(
         gamma_stage2=rt.edge_pred_gamma_stage2,
         strength_threshold=rt.edge_pred_strength_threshold,
         delta_e_each_stage=max(extra // 2, 1),
+        concurrency=concurrency,
     )
 
     if checkpoint_path:
